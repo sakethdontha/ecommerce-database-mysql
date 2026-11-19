@@ -1,3 +1,4 @@
+DROP PROCEDURE IF EXISTS ecommerce.process_purchase;
 DROP DATABASE IF EXISTS ecommerce;
 CREATE DATABASE ecommerce CHARSET utf8mb4; -- orginally set to utf8mb3 to "save space", but did some research that showed utf8mb4 was better
 -- in terms of perfomance and that utf8mb4 only used the extra byte of space if it needed it (like a varchar)
@@ -2053,7 +2054,7 @@ INSERT INTO order_items (order_id, product_id, quantity, price) VALUES
 SELECT *
 FROM order_items;
 
-SELECT u.user_id, u.username, SUM(i.quantity) AS total_quantity, SUM(i.quantity * i.price) AS order_sub_total, ANY_VALUE(IF(ISNULL(o.coupon_id),SUM(i.quantity * i.price),SUM((i.quantity * i.price) * (1 - s.discount / 100)))) AS user_revenue
+SELECT u.user_id, u.username, SUM(i.quantity) AS total_quantity, SUM(i.quantity * i.price) AS order_sub_total, SUM(i.quantity * i.price * (1 - COALESCE(s.discount, 0) / 100)) AS user_revenue
 FROM users u
 JOIN orders o ON o.user_id = u.user_id
 JOIN order_items i ON o.order_id = i.order_id
@@ -2086,13 +2087,13 @@ GROUP BY users.user_id, users.username, order_id;
 
 
 
-SELECT i.user_id, u.username,count(i.order_id), SUM(quantity), SUM(quantity*price),o.order_date
+SELECT o.user_id, u.username, COUNT(DISTINCT i.order_id) AS orders_placed, SUM(i.quantity) AS units, SUM(i.quantity*i.price) AS gross_sales
 FROM order_items i
-JOIN users u ON u.user_id=i.user_id
 JOIN orders o ON i.order_id=o.order_id
-WHERE YEAR(o.order_date)=2022 AND o.order_status!= "Cancelled"
-GROUP BY i.user_id,o.order_date
-ORDER BY SUM(quantity*price) DESC LIMIT 5;
+JOIN users u ON u.user_id=o.user_id
+WHERE YEAR(o.order_date)=2022 AND o.order_status != 'Cancelled'
+GROUP BY o.user_id, u.username
+ORDER BY gross_sales DESC LIMIT 5;
 
 INSERT INTO reviews (user_id, product_id, vendor_id, rating_value, content, review_date, review_helpfulness)
 VALUES
@@ -3480,6 +3481,15 @@ FROM user_search_history
 WHERE MATCH(search_text) AGAINST ('textbook')
 ORDER BY relsearch DESC;
 
+ALTER TABLE product
+ADD FULLTEXT (product_description,name,product_image_link);
+
+ALTER TABLE product
+ADD FULLTEXT (name);
+
+ALTER TABLE product
+ADD FULLTEXT (product_description,name);
+
 SELECT *,
 MATCH(product_description) AGAINST ('smartphone') as reldescr,
 MATCH(name) AGAINST ('smartphone') as relname
@@ -3493,14 +3503,6 @@ FROM product
 WHERE MATCH(product_description) AGAINST ('cargo')
 ORDER BY product_id;
 
-ALTER TABLE product
-ADD FULLTEXT (product_description,name,product_image_link);
-
-ALTER TABLE product
-ADD FULLTEXT (name);
-
-ALTER TABLE product
-ADD FULLTEXT (product_description,name);
 
 SELECT * 
 from product;
@@ -3819,8 +3821,6 @@ VALUES
 SELECT *
 FROM inventory;
 
-DROP TABLE inventory;
-
 DELIMITER //
 
 CREATE PROCEDURE process_purchase(
@@ -3849,9 +3849,7 @@ BEGIN
         WHERE product_id = p_product_id;
 		INSERT INTO orders (user_id,shipping_address_id,payment_method_id,shipping_method_id,coupon_id)
 		VALUES (p_user_id,p_shipping_address,p_payment_method_id,p_shipping_method_id,p_coupon_id);
-        SELECT order_id INTO new_order_id
-		FROM orders 
-		ORDER BY order_id DESC LIMIT 1;
+        SET new_order_id = LAST_INSERT_ID();
         SELECT price INTO product_price
         FROM product
         WHERE product_id=p_product_id;
@@ -3867,7 +3865,7 @@ END //
 
 DELIMITER ;
 
-CALL process_purchase(23,45,2,34,30,3,NULL,@message); -- (user_id,product_id,requested_quant,shipping_address,shipping_method,payment_method,coupon)
+CALL process_purchase(23,45,2,34,30,3,NULL,@message); -- (user_id, product_id, requested_quantity, shipping_address_id, payment_method_id, shipping_method_id, coupon_id)
 SELECT @message AS message;
 
 SELECT *
@@ -3877,9 +3875,6 @@ FROM inventory;
 SELECT *
 FROM orders;
 
-DROP PROCEDURE process_purchase;
-
-DROP TABLE inventory;
 
 SELECT *
 FROM orders;
@@ -3906,7 +3901,7 @@ LIMIT 3;
 WITH vendors AS(
 SELECT user_id as vend
 FROM users
-WHERE user_role='vendors')
+WHERE user_role='Vendor')
 SELECT v.vend
 FROM vendors v
 LEFT JOIN orders o
@@ -3915,19 +3910,15 @@ WHERE year(o.order_date)=2025 and MONTH(o.order_date)=1
 GROUP BY v.vend
 HAVING COUNT(o.order_id)=1;
 
-SELECT (SELECT COUNT(users.user_id) 
+SET @THIS_YEAR = 2025, @THIS_MONTH = 3;
+
+SELECT (SELECT COUNT(DISTINCT users.user_id) 
 		FROM users, product, orders, order_items
 		WHERE users.user_id = product.vendor_id and product.product_id = order_items.product_id and order_items.order_id = orders.order_id
         and MONTH(orders.order_date) = @THIS_MONTH and YEAR(orders.order_date) = @THIS_YEAR) as active_vendors, COUNT(users.user_id) as all_vendors
 FROM users
 WHERE users.user_role = 'Vendor';
 
-SELECT (SELECT COUNT(users.user_id) 
-		FROM users, orders
-		WHERE users.user_id = orders.order_id
-        and MONTH(orders.order_date) = @THIS_MONTH and YEAR(orders.order_date) = @THIS_YEAR) as active_vendors, COUNT(users.user_id) as all_vendors
-FROM users
-WHERE users.user_role = 'Vendor';
 
 SELECT *
 FROM product;
@@ -3951,24 +3942,25 @@ ORDER BY COUNT(*) DESC) AS t
 WHERE t.r=1
 ORDER BY user_id;
 
-SELECT MONTH(o.order_date),p.vendor_id, SUM(i.quantity*i.price), RANK() OVER(partition by MONTH(o.order_date) ORDER BY SUM(i.quantity*i.price) DESC ) as revenue_rank
+SELECT MONTH(o.order_date) AS mon, p.vendor_id, SUM(i.quantity*i.price) AS gross_sales, RANK() OVER(PARTITION BY MONTH(o.order_date) ORDER BY SUM(i.quantity*i.price) DESC) AS revenue_rank
 FROM product p
 JOIN order_items i ON p.product_id=i.product_id
-JOIN orders o ON o.user_id=p.product_id
+JOIN orders o ON o.order_id=i.order_id
 WHERE YEAR(order_date)=2022
-GROUP BY MONTH(o.order_date);
+GROUP BY MONTH(o.order_date), p.vendor_id;
 
-SELECT MONTH(o.order_date),p.vendor_id, ANY_VALUE(IF(ISNULL(o.coupon_id), SUM(i.price*i.quantity), SUM(i.price*i.quantity)*(1-(sale_coupon.discount/100)))) as revenue, RANK() OVER(partition by MONTH(o.order_date) ORDER BY  SUM(i.quantity*i.price) DESC) as r 
+SELECT MONTH(o.order_date) AS mon, p.vendor_id, SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) as revenue, RANK() OVER(PARTITION BY MONTH(o.order_date) ORDER BY SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) DESC) as r 
 FROM product p
 JOIN order_items i ON p.product_id=i.product_id
-JOIN orders o ON o.user_id=p.product_id
+JOIN orders o ON o.order_id=i.order_id
+LEFT JOIN sale_coupon ON o.coupon_id=sale_coupon.coupon_id
 WHERE YEAR(order_date)=2022
 GROUP BY MONTH(o.order_date), p.vendor_id
 ORDER BY MONTH(o.order_date);
 
 SELECT t.mon,t.vendor, t.revenue as rev
 from (
-SELECT MONTH(o.order_date) as mon,p.vendor_id as vendor, ANY_VALUE(IF(ISNULL(o.coupon_id), SUM(i.price*i.quantity), SUM(i.price*i.quantity)*(1-(sale_coupon.discount/100)))) as revenue, RANK() OVER(partition by MONTH(o.order_date) ORDER BY  SUM(i.quantity*i.price) DESC) as r 
+SELECT MONTH(o.order_date) as mon,p.vendor_id as vendor, SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) as revenue, RANK() OVER(PARTITION BY MONTH(o.order_date) ORDER BY SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) DESC) as r 
 FROM product p
 JOIN order_items i ON p.product_id=i.product_id
 JOIN orders o ON o.order_id=i.order_id
@@ -3978,22 +3970,24 @@ GROUP BY MONTH(o.order_date), p.vendor_id
 ORDER BY MONTH(o.order_date)) AS t
 WHERE t.r=1;
 
-SELECT o.user_id, SUM(i.quantity*i.price) as revenue, DENSE_RANK() OVER(ORDER BY SUM(i.quantity*i.price) DESC)
+SELECT o.user_id, SUM(i.quantity*i.price) as gross_sales, DENSE_RANK() OVER(ORDER BY SUM(i.quantity*i.price) DESC) as sales_rank
 FROM orders o
 JOIN order_items i ON o.order_id=i.order_id
 GROUP BY user_id
+ORDER BY gross_sales DESC
 LIMIT 5;
 
-SELECT o.user_id,ANY_VALUE(IF(ISNULL(o.coupon_id), SUM(i.price*i.quantity), SUM(i.price*i.quantity)*(1-(sale_coupon.discount/100)))) as revenue, DENSE_RANK() OVER(ORDER BY SUM(i.quantity*i.price) DESC)
+SELECT o.user_id, SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) as revenue, DENSE_RANK() OVER(ORDER BY SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) DESC) as revenue_rank
 FROM orders o
 JOIN order_items i ON o.order_id=i.order_id
 LEFT JOIN sale_coupon ON o.coupon_id=sale_coupon.coupon_id
 GROUP BY user_id
+ORDER BY revenue DESC
 LIMIT 5;
 
 SELECT p.vendor_id, AVG(r.rating_value) as rating
 FROM product p
-JOIN reviews r ON p.product_id=r.review_id
+JOIN reviews r ON p.product_id=r.product_id
 GROUP BY vendor_id
 ORDER BY AVG(r.rating_value) DESC
 LIMIT 5;
@@ -4032,7 +4026,7 @@ GROUP BY user_id) as t
 WHERE t.coun>=2;
 
 WITH rev AS(
-SELECT YEAR(order_date) as y, MONTH(order_date) as m, ANY_VALUE(IF(ISNULL(o.coupon_id),SUM(i.quantity*i.price), SUM(i.quantity*i.price)*(1-(sale_coupon.discount/100)))) as revenue
+SELECT YEAR(order_date) as y, MONTH(order_date) as m, SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) as revenue
 FROM orders o
 JOIN order_items i ON o.order_id=i.order_id
 LEFT JOIN sale_coupon ON sale_coupon.coupon_id=o.coupon_id
@@ -4052,7 +4046,7 @@ SELECT y1, y2 FROM year_1, year_2;
 
 SELECT COUNT(user_id)
 FROM users
-WHERE user_role='vendor';
+WHERE user_role='Vendor';
 
 SELECT COUNT(p.vendor_id)
 FROM orders o 
@@ -4074,7 +4068,7 @@ GROUP BY user_id;
 
 SELECT t.mon, t.id, t.revenue
 FROM(
-SELECT MONTH(o.order_date) as mon, p.vendor_id as id, ANY_VALUE(IF(ISNULL(o.coupon_id),(SUM(i.quantity*i.price)), SUM(i.quantity*i.price)*(1-(sale_coupon.discount)/100))) as revenue, RANK() OVER(PARTITION BY MONTH(order_date) ORDER BY ANY_VALUE(IF(ISNULL(o.coupon_id),(SUM(i.quantity*i.price)), SUM(i.quantity*i.price)*(1-(sale_coupon.discount)/100))) DESC ) as r
+SELECT MONTH(o.order_date) as mon, p.vendor_id as id, SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) as revenue, RANK() OVER(PARTITION BY MONTH(order_date) ORDER BY SUM(i.quantity * i.price * (1 - COALESCE(sale_coupon.discount, 0) / 100)) DESC) as r
 FROM orders o
 JOIN order_items i ON o.order_id=i.order_id
 LEFT JOIN sale_coupon ON sale_coupon.coupon_id=o.coupon_id
@@ -4138,18 +4132,13 @@ FROM reviews
 GROUP BY vendor_id
 ORDER BY AVG(rating_value) DESC;
 
-ALTER TABLE product
-ADD FULLTEXT (name,product_description);
-
-ALTER TABLE product
-ADD FULLTEXT (name);
 
 
 SELECT *,
 MATCH(name) AGAINST('trackpants') as relname,
 MATCH(product_description) AGAINST('blue') as reldescr
 FROM product
-WHERE MATCH(name,product_description) AGAINST ('trackpants''blue') 
+WHERE MATCH(name,product_description) AGAINST ('trackpants blue') 
 ORDER BY relname*2+reldescr DESC;
 
 
